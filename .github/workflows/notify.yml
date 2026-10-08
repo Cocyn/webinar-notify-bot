@@ -1,0 +1,55 @@
+name: Webinar notify bot
+
+on:
+  schedule:
+    # Каждые 5 минут, круглосуточно — для публичного репозитория минуты
+    # GitHub Actions бесплатны и не лимитированы, так что ограничивать
+    # часы/дни недели не обязательно (но при желании можно, см. README).
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}   # кнопка "Run workflow" в вкладке Actions — для ручной проверки
+
+# Не даём двум запускам работать параллельно, чтобы не было конфликтов
+# при коммите файла состояния.
+concurrency:
+  group: webinar-notify-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # нужно, чтобы шаг ниже мог закоммитить bot_state.json обратно
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run notify bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          CRED_JSON: ${{ secrets.CRED_JSON }}
+          SCHEDULE_YEAR: "2026"
+          LEAD_MINUTES: "5"
+        run: python3 notify_bot.py
+
+      - name: Commit updated state (if changed)
+        run: |
+          if git diff --quiet -- bot_state.json; then
+            echo "Состояние не изменилось — коммит не нужен."
+            exit 0
+          fi
+          git config user.name "webinar-notify-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add bot_state.json
+          git commit -m "chore: update bot state [skip ci]"
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"

@@ -1,0 +1,6 @@
+# Никогда не коммитьте файл с паролями/ссылками — его содержимое идёт
+# только в секрет CRED_JSON через настройки репозитория на GitHub.
+credentials_SECRET_paste_into_github.json
+
+__pycache__/
+*.pyc
