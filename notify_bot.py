@@ -220,13 +220,16 @@ def build_status_text(lessons: list, now: datetime) -> Optional[str]:
 
     current = None
     nxt = None
+    nxt_idx = None
     for i, lesson in enumerate(lessons):
         if lesson.start <= now < lesson_end(lesson, lessons):
             current = lesson
             nxt = lessons[i + 1] if i + 1 < len(lessons) else None
+            nxt_idx = i + 1 if nxt else None
             break
         if lesson.start > now:
             nxt = lesson
+            nxt_idx = i
             break
 
     if current is not None:
@@ -239,7 +242,10 @@ def build_status_text(lessons: list, now: datetime) -> Optional[str]:
             status = f"⏳ Следующее занятие сегодня (через {mins} мин):"
         else:
             status = "⏳ Следующее занятие:"
-        return nxt.card(status)
+
+        after_next = lessons[nxt_idx + 1] if nxt_idx + 1 < len(lessons) else None
+        next_line = f"➡️ А после — {describe_next(nxt, after_next)}" if after_next else ""
+        return nxt.card(status, next_line)
 
     return None  # занятий больше нет — расписание закончилось
 
