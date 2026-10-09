@@ -2,20 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 Телеграм-бот для GitHub Actions: редактирует одно закреплённое сообщение,
-показывая занятие, которое начинается через несколько минут.
+всегда показывая либо текущее идущее занятие (со ссылкой/паролем), либо,
+если сейчас перерыв, время и тему следующего.
 
-В отличие от версии для VPS, этот скрипт выполняется ОДИН РАЗ за запуск
-(GitHub Actions запускает его по расписанию каждые 5 минут) и завершается —
-никакого бесконечного цикла. Состояние (id сообщения, какие занятия уже
-анонсированы) хранится в файле bot_state.json и коммитится обратно в
-репозиторий шагом workflow, чтобы следующий запуск (на свежей машине) его
-увидел.
-
-Расписание (даты/время/дисциплина/преподаватель/аудитория) лежит в
-schedule.json в самом репозитории — в нём нет паролей и ссылок.
-Пароли и ссылки на вебинары приходят из секрета CRED_JSON (переменная
-окружения), который хранится в настройках репозитория и никогда не
-попадает в код.
+Запускается по расписанию (cron в .github/workflows/notify.yml) — каждый
+запуск одноразовый: прочитал расписание, посчитал статус, отредактировал
+сообщение, вышел. Расписание — в schedule.json (без паролей/ссылок,
+можно хранить в публичном репозитории). Пароли и ссылки — в секрете
+CRED_JSON (переменная окружения), никогда не попадают в код.
 """
 
 import json
@@ -39,12 +33,10 @@ CHAT_ID = os.environ.get("CHAT_ID", "").strip()
 CRED_JSON = os.environ.get("CRED_JSON", "").strip()
 SCHEDULE_PATH = os.environ.get("SCHEDULE_PATH", "schedule.json")
 SCHEDULE_YEAR = int(os.environ.get("SCHEDULE_YEAR", "2026"))
-LEAD_MINUTES = int(os.environ.get("LEAD_MINUTES", "5"))
-# Окно шире, чем LEAD_MINUTES, — компенсирует то, что крон GitHub Actions
-# запускается не идеально вовремя (может быть задержка в несколько минут).
-PRE_WINDOW_MINUTES = int(os.environ.get("PRE_WINDOW_MINUTES", "7"))
-START_WINDOW_MINUTES = int(os.environ.get("START_WINDOW_MINUTES", "7"))
-NOTIFY_ON_START = os.environ.get("NOTIFY_ON_START", "true").lower() in ("1", "true", "yes")
+# Сколько минут считать занятие "идущим", если не знаем точного времени
+# окончания (в schedule.json его нет) — используется только для ПОСЛЕДНЕГО
+# занятия дня; для остальных конец = начало следующего занятия в тот же день.
+DEFAULT_DURATION_MINUTES = int(os.environ.get("DEFAULT_DURATION_MINUTES", "100"))
 PIN_MESSAGE = os.environ.get("PIN_MESSAGE", "true").lower() in ("1", "true", "yes")
 TIMEZONE_NAME = os.environ.get("TIMEZONE", "Europe/Moscow")
 STATE_PATH = os.environ.get("STATE_PATH", "bot_state.json")
@@ -76,13 +68,15 @@ class Lesson:
     link: str
     start: datetime
 
-    def key(self) -> str:
-        return f"{self.date_str}_{self.time_str}_{self.room}"
+    def short(self) -> str:
+        """Короткая строка для 'Далее: ...'."""
+        return f"{self.time_str} — {escape_html(self.discipline)}"
 
-    def format_message(self, status: str) -> str:
+    def card(self, status: str, next_line: str = "") -> str:
         pass_line = "" if not self.password or self.password.lower() in ("без пароля", "нет", "") \
             else f"🔑 Пароль: <code>{escape_html(self.password)}</code>\n"
-        link_line = f'🔗 <a href="{escape_html(self.link)}">Подключиться к вебинару</a>' if self.link else ""
+        link_line = f'🔗 <a href="{escape_html(self.link)}">Подключиться к вебинару</a>\n' if self.link else ""
+        tail = f"\n{next_line}" if next_line else ""
         return (
             f"{status}\n\n"
             f"📅 {escape_html(self.date_str)} ({escape_html(self.weekday)}), {escape_html(self.time_str)}\n"
@@ -91,6 +85,7 @@ class Lesson:
             f"🏫 Ауд. {escape_html(self.room)}\n"
             f"{pass_line}"
             f"{link_line}"
+            f"{tail}"
         ).strip()
 
 
@@ -113,7 +108,6 @@ def load_lessons() -> list:
         cred = creds.get(room, {})
         link = cred.get("link", "")
         if not link:
-            # нет ссылки для этой аудитории — пропускаем, нечего показывать
             continue
         try:
             day, month = (int(x) for x in date_str.split("."))
@@ -147,7 +141,7 @@ def load_state() -> dict:
             return json.loads(p.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             log.warning("Файл состояния повреждён — начинаю заново")
-    return {"message_id": None, "notified_pre": [], "notified_start": [], "finished_sent": False}
+    return {"message_id": None, "finished_sent": False}
 
 
 def save_state(state: dict) -> None:
@@ -165,6 +159,10 @@ def tg_call(method: str, **params):
     resp = requests.post(url, json=params, timeout=15)
     data = resp.json()
     if not data.get("ok"):
+        desc = str(data.get("description", ""))
+        if "message is not modified" in desc.lower():
+            # текст не изменился с прошлого раза — это не ошибка
+            return {"ok": True, "result": {"message_id": params.get("message_id")}, "unchanged": True}
         log.error("Telegram API ошибка (%s): %s", method, data)
     return data
 
@@ -193,13 +191,63 @@ def get_now() -> datetime:
 def ensure_message(state: dict) -> Optional[int]:
     if state.get("message_id"):
         return state["message_id"]
-    message_id = send_message("🕐 Ожидание ближайшего занятия…\nЭто сообщение будет обновляться автоматически.")
+    message_id = send_message("🕐 Загружаю расписание…")
     if message_id is not None:
         state["message_id"] = message_id
         if PIN_MESSAGE and not DRY_RUN:
             pin_message(message_id)
         log.info("Создано новое сообщение-статус, id=%s", message_id)
     return message_id
+
+
+def lesson_end(lesson: Lesson, lessons: list) -> datetime:
+    """Момент, когда занятие считается закончившимся: не позже, чем через
+    DEFAULT_DURATION_MINUTES, и не позже начала следующего занятия в тот
+    же день (если пары идут подряд без большого перерыва — не захватываем
+    чужое время)."""
+    by_duration = lesson.start + timedelta(minutes=DEFAULT_DURATION_MINUTES)
+    idx = lessons.index(lesson)
+    if idx + 1 < len(lessons):
+        nxt = lessons[idx + 1]
+        if nxt.start.date() == lesson.start.date():
+            return min(by_duration, nxt.start)
+    return by_duration
+
+
+def build_status_text(lessons: list, now: datetime) -> Optional[str]:
+    if not lessons:
+        return None
+
+    current = None
+    nxt = None
+    for i, lesson in enumerate(lessons):
+        if lesson.start <= now < lesson_end(lesson, lessons):
+            current = lesson
+            nxt = lessons[i + 1] if i + 1 < len(lessons) else None
+            break
+        if lesson.start > now:
+            nxt = lesson
+            break
+
+    if current is not None:
+        next_line = f"➡️ Далее: {describe_next(current, nxt)}" if nxt else "✅ Это последнее занятие по расписанию."
+        return current.card("🔴 Сейчас идёт:", next_line)
+
+    if nxt is not None:
+        mins = int((nxt.start - now).total_seconds() // 60)
+        if nxt.start.date() == now.date() and 0 <= mins < 24 * 60:
+            status = f"⏳ Следующее занятие сегодня (через {mins} мин):"
+        else:
+            status = "⏳ Следующее занятие:"
+        return nxt.card(status)
+
+    return None  # занятий больше нет — расписание закончилось
+
+
+def describe_next(current: Lesson, nxt: Lesson) -> str:
+    if nxt.start.date() == current.start.date():
+        return nxt.short()
+    return f"{nxt.date_str} ({nxt.weekday}), {nxt.short()}"
 
 
 def main():
@@ -215,58 +263,22 @@ def main():
         return
 
     now = get_now()
-    today = now.date()
-
     lessons = load_lessons()
-    if not lessons:
-        log.info("В schedule.json нет занятий с подходящими ссылками.")
-        save_state(state)
-        return
+    text = build_status_text(lessons, now)
 
-    last_schedule_date = lessons[-1].start.date()
-
-    if today > last_schedule_date:
+    if text is None:
         if not state.get("finished_sent"):
-            edit_message(
-                message_id,
-                "✅ Расписание закончилось.\n"
-                "Когда появится новое — обновите schedule.json (и, если нужно, секрет CRED_JSON) в репозитории.",
-            )
+            edit_message(message_id, "✅ Расписание закончилось.\n"
+                                      "Когда появится новое — обновите schedule.json (и CRED_JSON, если нужно).")
             state["finished_sent"] = True
-            log.info("Расписание завершено (последняя дата %s).", last_schedule_date)
+            log.info("Расписание завершено.")
         save_state(state)
         return
 
-    today_lessons = [l for l in lessons if l.start.date() == today]
-    changed = False
-
-    for lesson in today_lessons:
-        pre_trigger = lesson.start - timedelta(minutes=PRE_WINDOW_MINUTES)
-        key = lesson.key()
-
-        if pre_trigger <= now < lesson.start and key not in state["notified_pre"]:
-            text = lesson.format_message(f"⏰ Через {LEAD_MINUTES} минут начинается:")
-            if edit_message(message_id, text):
-                state["notified_pre"].append(key)
-                changed = True
-                log.info("«Скоро начнётся»: %s %s %s", lesson.date_str, lesson.time_str, lesson.discipline)
-
-        if NOTIFY_ON_START and lesson.start <= now < lesson.start + timedelta(minutes=START_WINDOW_MINUTES) \
-                and key not in state["notified_start"]:
-            text = lesson.format_message("🔴 Сейчас идёт:")
-            if edit_message(message_id, text):
-                state["notified_start"].append(key)
-                changed = True
-                log.info("«Началось»: %s %s %s", lesson.date_str, lesson.time_str, lesson.discipline)
-
-    if len(state["notified_pre"]) > 300:
-        state["notified_pre"] = state["notified_pre"][-150:]
-    if len(state["notified_start"]) > 300:
-        state["notified_start"] = state["notified_start"][-150:]
-
+    result = edit_message(message_id, text)
+    if result:
+        log.info("Сообщение обновлено (%s).", now.strftime("%H:%M"))
     save_state(state)
-    if not changed:
-        log.info("Сейчас (%s) ближайших триггеров нет, занятий сегодня: %d.", now.strftime("%H:%M"), len(today_lessons))
 
 
 if __name__ == "__main__":

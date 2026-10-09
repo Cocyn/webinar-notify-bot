@@ -38,7 +38,6 @@ jobs:
           CHAT_ID: ${{ secrets.CHAT_ID }}
           CRED_JSON: ${{ secrets.CRED_JSON }}
           SCHEDULE_YEAR: "2026"
-          LEAD_MINUTES: "5"
         run: python3 notify_bot.py
 
       - name: Commit updated state (if changed)
