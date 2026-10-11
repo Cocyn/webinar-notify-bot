@@ -18,7 +18,6 @@ import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Optional
 
 try:
@@ -37,9 +36,9 @@ SCHEDULE_YEAR = int(os.environ.get("SCHEDULE_YEAR", "2026"))
 # окончания (в schedule.json его нет) — используется только для ПОСЛЕДНЕГО
 # занятия дня; для остальных конец = начало следующего занятия в тот же день.
 DEFAULT_DURATION_MINUTES = int(os.environ.get("DEFAULT_DURATION_MINUTES", "100"))
+MESSAGE_ID = os.environ.get("MESSAGE_ID", "").strip()
 PIN_MESSAGE = os.environ.get("PIN_MESSAGE", "true").lower() in ("1", "true", "yes")
 TIMEZONE_NAME = os.environ.get("TIMEZONE", "Europe/Moscow")
-STATE_PATH = os.environ.get("STATE_PATH", "bot_state.json")
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() in ("1", "true", "yes")
 FAKE_NOW = os.environ.get("FAKE_NOW", "").strip()
 
@@ -134,20 +133,6 @@ def load_lessons() -> list:
     return lessons
 
 
-def load_state() -> dict:
-    p = Path(STATE_PATH)
-    if p.exists():
-        try:
-            return json.loads(p.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            log.warning("Файл состояния повреждён — начинаю заново")
-    return {"message_id": None, "finished_sent": False}
-
-
-def save_state(state: dict) -> None:
-    Path(STATE_PATH).write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
 def tg_call(method: str, **params):
     if DRY_RUN:
         log.info("[DRY_RUN] %s(%s)", method, {k: v for k, v in params.items() if k != "text"})
@@ -188,15 +173,28 @@ def get_now() -> datetime:
     return datetime.now(TZ)
 
 
-def ensure_message(state: dict) -> Optional[int]:
-    if state.get("message_id"):
-        return state["message_id"]
+def ensure_message() -> Optional[int]:
+    """Берём id сообщения из переменной MESSAGE_ID (зафиксирована один раз
+    в настройках репозитория). Если она не задана — создаём и закрепляем
+    новое сообщение и выводим его id в лог, чтобы сохранить в MESSAGE_ID."""
+    if MESSAGE_ID:
+        try:
+            return int(MESSAGE_ID)
+        except ValueError:
+            log.error("MESSAGE_ID=%r — не число.", MESSAGE_ID)
+            return None
+
     message_id = send_message("🕐 Загружаю расписание…")
     if message_id is not None:
-        state["message_id"] = message_id
         if PIN_MESSAGE and not DRY_RUN:
             pin_message(message_id)
-        log.info("Создано новое сообщение-статус, id=%s", message_id)
+        log.info(
+            "MESSAGE_ID не задан — создано новое сообщение id=%s. "
+            "Сохраните его в репозитории: Settings → Secrets and variables → "
+            "Actions → Variables → New repository variable → MESSAGE_ID = %s, "
+            "иначе каждый запуск будет создавать новое сообщение.",
+            message_id, message_id,
+        )
     return message_id
 
 
@@ -261,11 +259,9 @@ def main():
         log.error("Не заданы BOT_TOKEN и/или CHAT_ID (секреты репозитория).")
         sys.exit(1)
 
-    state = load_state()
-    message_id = ensure_message(state)
+    message_id = ensure_message()
     if message_id is None:
         log.error("Не удалось создать/найти сообщение — выхожу без изменений.")
-        save_state(state)
         return
 
     now = get_now()
@@ -273,18 +269,13 @@ def main():
     text = build_status_text(lessons, now)
 
     if text is None:
-        if not state.get("finished_sent"):
-            edit_message(message_id, "✅ Расписание закончилось.\n"
-                                      "Когда появится новое — обновите schedule.json (и CRED_JSON, если нужно).")
-            state["finished_sent"] = True
-            log.info("Расписание завершено.")
-        save_state(state)
+        edit_message(message_id, "✅ Расписание закончилось.\n"
+                                  "Когда появится новое — обновите schedule.json (и CRED_JSON, если нужно).")
+        log.info("Расписание завершено.")
         return
 
-    result = edit_message(message_id, text)
-    if result:
-        log.info("Сообщение обновлено (%s).", now.strftime("%H:%M"))
-    save_state(state)
+    if edit_message(message_id, text):
+        log.info("Сообщение (id=%s) обновлено (%s).", message_id, now.strftime("%H:%M"))
 
 
 if __name__ == "__main__":

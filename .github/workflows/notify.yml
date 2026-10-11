@@ -8,14 +8,12 @@ on:
     - cron: "*/5 * * * *"
   workflow_dispatch: {}   # кнопка "Run workflow" в вкладке Actions — для ручной проверки
 
-# Не даём двум запускам работать параллельно, чтобы не было конфликтов
-# при коммите файла состояния.
+# На случай если два запуска всё же пересекутся по времени — не даём им
+# работать параллельно (хотя теперь это не критично: бот ничего не
+# коммитит, конфликтовать нечему).
 concurrency:
   group: webinar-notify-bot
   cancel-in-progress: false
-
-permissions:
-  contents: write   # нужно, чтобы шаг ниже мог закоммитить bot_state.json обратно
 
 jobs:
   notify:
@@ -37,18 +35,10 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
           CRED_JSON: ${{ secrets.CRED_JSON }}
+          # id сообщения, которое бот всегда редактирует (не создаёт новое).
+          # Задаётся как переменная репозитория — Settings → Secrets and
+          # variables → Actions → вкладка Variables → New repository
+          # variable → MESSAGE_ID.
+          MESSAGE_ID: ${{ vars.MESSAGE_ID }}
           SCHEDULE_YEAR: "2026"
         run: python3 notify_bot.py
-
-      - name: Commit updated state (if changed)
-        run: |
-          if git diff --quiet -- bot_state.json; then
-            echo "Состояние не изменилось — коммит не нужен."
-            exit 0
-          fi
-          git config user.name "webinar-notify-bot"
-          git config user.email "actions@users.noreply.github.com"
-          git add bot_state.json
-          git commit -m "chore: update bot state [skip ci]"
-          git pull --rebase origin "${GITHUB_REF_NAME}"
-          git push origin "HEAD:${GITHUB_REF_NAME}"
