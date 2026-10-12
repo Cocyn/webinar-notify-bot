@@ -31,14 +31,23 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run notify bot
+        id: notify
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
           CRED_JSON: ${{ secrets.CRED_JSON }}
-          # id сообщения, которое бот всегда редактирует (не создаёт новое).
-          # Задаётся как переменная репозитория — Settings → Secrets and
-          # variables → Actions → вкладка Variables → New repository
-          # variable → MESSAGE_ID.
           MESSAGE_ID: ${{ vars.MESSAGE_ID }}
+          TEXT_HASH: ${{ vars.TEXT_HASH }}
           SCHEDULE_YEAR: "2026"
         run: python3 notify_bot.py
+
+      # Запускается, только если статус реально изменился (см. notify_bot.py).
+      # Обновляет переменные репозитория через gh CLI — нужен PAT-секрет
+      # ACTIONS_PAT, т.к. встроенный GITHUB_TOKEN не может менять переменные.
+      - name: Save new MESSAGE_ID / TEXT_HASH
+        if: steps.notify.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.ACTIONS_PAT }}
+        run: |
+          gh variable set MESSAGE_ID --body "${{ steps.notify.outputs.message_id }}" --repo "${{ github.repository }}"
+          gh variable set TEXT_HASH --body "${{ steps.notify.outputs.text_hash }}" --repo "${{ github.repository }}"

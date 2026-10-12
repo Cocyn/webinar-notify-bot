@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Телеграм-бот для GitHub Actions: редактирует одно закреплённое сообщение,
-всегда показывая либо текущее идущее занятие (со ссылкой/паролем), либо,
-если сейчас перерыв, время и тему следующего.
+Телеграм-бот для GitHub Actions: при изменении статуса отправляет НОВОЕ
+закреплённое сообщение (текущее/следующее занятие, со ссылкой/паролем),
+а старое — открепляет и удаляет. Если статус не изменился — ничего не
+делает (без лишних сообщений/уведомлений).
 
 Запускается по расписанию (cron в .github/workflows/notify.yml) — каждый
-запуск одноразовый: прочитал расписание, посчитал статус, отредактировал
-сообщение, вышел. Расписание — в schedule.json (без паролей/ссылок,
+запуск одноразовый. Расписание — в schedule.json (без паролей/ссылок,
 можно хранить в публичном репозитории). Пароли и ссылки — в секрете
 CRED_JSON (переменная окружения), никогда не попадают в код.
+
+id последнего сообщения и хэш его текста хранятся в переменных
+репозитория MESSAGE_ID / TEXT_HASH (не в файле — чтобы не было
+git-конфликтов). Этот скрипт только печатает новые значения в
+GITHUB_OUTPUT; обновляет переменные отдельный шаг workflow (через gh CLI
+и PAT-секрет ACTIONS_PAT).
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -37,6 +44,7 @@ SCHEDULE_YEAR = int(os.environ.get("SCHEDULE_YEAR", "2026"))
 # занятия дня; для остальных конец = начало следующего занятия в тот же день.
 DEFAULT_DURATION_MINUTES = int(os.environ.get("DEFAULT_DURATION_MINUTES", "100"))
 MESSAGE_ID = os.environ.get("MESSAGE_ID", "").strip()
+TEXT_HASH = os.environ.get("TEXT_HASH", "").strip()
 PIN_MESSAGE = os.environ.get("PIN_MESSAGE", "true").lower() in ("1", "true", "yes")
 TIMEZONE_NAME = os.environ.get("TIMEZONE", "Europe/Moscow")
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() in ("1", "true", "yes")
@@ -165,35 +173,26 @@ def pin_message(message_id: int) -> None:
     tg_call("pinChatMessage", chat_id=CHAT_ID, message_id=message_id, disable_notification=True)
 
 
+def unpin_message(message_id: int) -> None:
+    tg_call("unpinChatMessage", chat_id=CHAT_ID, message_id=message_id)
+
+
+def delete_message(message_id: int) -> None:
+    tg_call("deleteMessage", chat_id=CHAT_ID, message_id=message_id)
+
+
 def get_now() -> datetime:
     if FAKE_NOW:
         return datetime.strptime(FAKE_NOW, "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
     return datetime.now(TZ)
 
 
-def ensure_message() -> Optional[int]:
-    """Берём id сообщения из переменной MESSAGE_ID (зафиксирована один раз
-    в настройках репозитория). Если она не задана — создаём и закрепляем
-    новое сообщение и выводим его id в лог, чтобы сохранить в MESSAGE_ID."""
-    if MESSAGE_ID:
-        try:
-            return int(MESSAGE_ID)
-        except ValueError:
-            log.error("MESSAGE_ID=%r — не число.", MESSAGE_ID)
-            return None
-
-    message_id = send_message("🕐 Загружаю расписание…")
-    if message_id is not None:
-        if PIN_MESSAGE and not DRY_RUN:
-            pin_message(message_id)
-        log.info(
-            "MESSAGE_ID не задан — создано новое сообщение id=%s. "
-            "Сохраните его в репозитории: Settings → Secrets and variables → "
-            "Actions → Variables → New repository variable → MESSAGE_ID = %s, "
-            "иначе каждый запуск будет создавать новое сообщение.",
-            message_id, message_id,
-        )
-    return message_id
+def write_output(name: str, value: str) -> None:
+    path = os.environ.get("GITHUB_OUTPUT")
+    if not path:
+        return
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"{name}={value}\n")
 
 
 def lesson_end(lesson: Lesson, lessons: list) -> datetime:
@@ -251,23 +250,36 @@ def main():
         log.error("Не заданы BOT_TOKEN и/или CHAT_ID (секреты репозитория).")
         sys.exit(1)
 
-    message_id = ensure_message()
-    if message_id is None:
-        log.error("Не удалось создать/найти сообщение — выхожу без изменений.")
-        return
-
     now = get_now()
     lessons = load_lessons()
-    text = build_status_text(lessons, now)
+    text = build_status_text(lessons, now) or (
+        "✅ Расписание закончилось.\n"
+        "Когда появится новое — обновите schedule.json (и CRED_JSON, если нужно)."
+    )
+    new_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
-    if text is None:
-        edit_message(message_id, "✅ Расписание закончилось.\n"
-                                  "Когда появится новое — обновите schedule.json (и CRED_JSON, если нужно).")
-        log.info("Расписание завершено.")
+    old_id = int(MESSAGE_ID) if MESSAGE_ID.isdigit() else None
+
+    if old_id is not None and new_hash == TEXT_HASH:
+        log.info("Статус не изменился — ничего не отправляю.")
         return
 
-    if edit_message(message_id, text):
-        log.info("Сообщение (id=%s) обновлено (%s).", message_id, now.strftime("%H:%M"))
+    new_id = send_message(text)
+    if new_id is None:
+        log.error("Не удалось отправить сообщение.")
+        return
+    if PIN_MESSAGE:
+        pin_message(new_id)
+
+    if old_id is not None and old_id != new_id:
+        unpin_message(old_id)
+        delete_message(old_id)
+
+    log.info("Новое сообщение id=%s отправлено и закреплено (%s). Старое id=%s удалено.",
+              new_id, now.strftime("%H:%M"), old_id)
+    write_output("changed", "true")
+    write_output("message_id", str(new_id))
+    write_output("text_hash", new_hash)
 
 
 if __name__ == "__main__":
