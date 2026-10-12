@@ -67,25 +67,23 @@ class Lesson:
     link: str
     start: datetime
 
-    def short(self) -> str:
-        """Короткая строка для 'Далее: ...'."""
-        return f"{self.time_str} — {escape_html(self.discipline)}"
-
-    def card(self, status: str, next_line: str = "") -> str:
+    def details(self) -> str:
+        """Полный блок с данными занятия (дата, предмет, пароль, ссылка)."""
         pass_line = "" if not self.password or self.password.lower() in ("без пароля", "нет", "") \
             else f"🔑 Пароль: <code>{escape_html(self.password)}</code>\n"
         link_line = f'🔗 <a href="{escape_html(self.link)}">Подключиться к вебинару</a>\n' if self.link else ""
-        tail = f"\n{next_line}" if next_line else ""
         return (
-            f"{status}\n\n"
             f"📅 {escape_html(self.date_str)} ({escape_html(self.weekday)}), {escape_html(self.time_str)}\n"
             f"📘 {escape_html(self.lesson_type)}: {escape_html(self.discipline)}\n"
             f"👤 {escape_html(self.teacher)}\n"
             f"🏫 Ауд. {escape_html(self.room)}\n"
             f"{pass_line}"
             f"{link_line}"
-            f"{tail}"
         ).strip()
+
+    def card(self, status: str, next_line: str = "") -> str:
+        tail = f"\n\n{next_line}" if next_line else ""
+        return f"{status}\n\n{self.details()}{tail}".strip()
 
 
 def escape_html(text) -> str:
@@ -231,7 +229,7 @@ def build_status_text(lessons: list, now: datetime) -> Optional[str]:
             break
 
     if current is not None:
-        next_line = f"➡️ Далее: {describe_next(current, nxt)}" if nxt else "✅ Это последнее занятие по расписанию."
+        next_line = f"➡️ Далее:\n{nxt.details()}" if nxt else "✅ Это последнее занятие по расписанию."
         return current.card("🔴 Сейчас идёт:", next_line)
 
     if nxt is not None:
@@ -242,16 +240,10 @@ def build_status_text(lessons: list, now: datetime) -> Optional[str]:
             status = "⏳ Следующее занятие:"
 
         after_next = lessons[nxt_idx + 1] if nxt_idx + 1 < len(lessons) else None
-        next_line = f"➡️ А после — {describe_next(nxt, after_next)}" if after_next else ""
+        next_line = f"➡️ А после:\n{after_next.details()}" if after_next else ""
         return nxt.card(status, next_line)
 
     return None  # занятий больше нет — расписание закончилось
-
-
-def describe_next(current: Lesson, nxt: Lesson) -> str:
-    if nxt.start.date() == current.start.date():
-        return nxt.short()
-    return f"{nxt.date_str} ({nxt.weekday}), {nxt.short()}"
 
 
 def main():
