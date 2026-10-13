@@ -39,6 +39,7 @@ jobs:
           MESSAGE_ID: ${{ vars.MESSAGE_ID }}
           TEXT_HASH: ${{ vars.TEXT_HASH }}
           SCHEDULE_YEAR: "2026"
+          PIN_MESSAGE: "false"
         run: python3 notify_bot.py
 
       # Запускается, только если статус реально изменился (см. notify_bot.py).
